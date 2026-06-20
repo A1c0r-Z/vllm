@@ -75,6 +75,14 @@ class BaseMambaAttentionMetadata:
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
 
+    # ReplaySSM AR-decode fields (None unless --use-replayssm). Per-decode-row
+    # ring-buffer write cursor and end-of-window flush flag; bc_pre_scratch is
+    # the per-step (decode_rows, ngroups, max_cache_len) fp32 scratch used only
+    # by the output_only route.
+    write_pos_d: torch.Tensor | None = None
+    is_flush_d: torch.Tensor | None = None
+    bc_pre_scratch: torch.Tensor | None = None
+
 
 class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
     metadata_cls: type[M]
@@ -98,6 +106,8 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         self.compilation_config = vllm_config.compilation_config
         self.num_spec_tokens: int = vllm_config.num_speculative_tokens
         self.use_spec_decode = self.num_spec_tokens > 0
+        self.use_cached_kernel = vllm_config.cache_config.use_replayssm
+        self.max_cache_len = vllm_config.cache_config.replayssm_buffer_len
 
         assert isinstance(kv_cache_spec, MambaSpec)
         scheduler_config = vllm_config.scheduler_config
@@ -158,6 +168,48 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 dtype=torch.int32,
                 device=device,
             )
+
+        # ReplaySSM AR-decode: fixed-address persistent buffers for CUDA-graph
+        # capture of the per-step ring-buffer cursor / flush flag / bc_pre scratch.
+        self.cached_kernel_variant: str = (
+            vllm_config.cache_config.replayssm_route
+            if self.use_cached_kernel
+            else "state_and_output"
+        )
+        self.decode_bc_pre_scratch: torch.Tensor | None = None
+        if self.use_cached_kernel:
+            self.decode_write_pos_d: torch.Tensor = torch.empty(
+                (self.decode_cudagraph_max_bs,),
+                dtype=torch.int32,
+                device=device,
+            )
+            self.decode_is_flush_d: torch.Tensor = torch.empty(
+                (self.decode_cudagraph_max_bs,),
+                dtype=torch.int8,
+                device=device,
+            )
+            if self.cached_kernel_variant == "output_only":
+                # Page index for the 5-tensor Mamba2 ReplaySSM page is
+                # (conv, ssm, x_cache, dt_cache, B_cache); B_cache[0] is ngroups.
+                if len(kv_cache_spec.shapes) < 5:
+                    raise ValueError(
+                        "ReplaySSM output_only route requires the 5-tensor Mamba2 "
+                        "page (conv, ssm, x_cache, dt_cache, B_cache)"
+                    )
+                bc_ngroups = kv_cache_spec.shapes[4][0]
+                # bc_pre is consumed on EVERY decode step (eager and cudagraph),
+                # so it must cover the max decode batch (max_num_seqs), not just
+                # decode_cudagraph_max_bs (which is 0 under enforce_eager). Sizing
+                # larger is CUDA-graph safe: the captured [:padded_bs] slice keeps
+                # the same offset-0 base pointer.
+                bc_scratch_bs = max(
+                    self.decode_cudagraph_max_bs, scheduler_config.max_num_seqs
+                )
+                self.decode_bc_pre_scratch = torch.empty(
+                    (bc_scratch_bs, bc_ngroups, self.max_cache_len),
+                    dtype=torch.float32,
+                    device=device,
+                )
 
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
         if self.use_spec_decode:
@@ -401,6 +453,14 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         has_prior_state = seq_lens_cpu > 1
         prefill_to_decode = single_token_prefill_rows & has_prior_state
         if torch.any(prefill_to_decode).item():
+            if self.use_cached_kernel:
+                # These rows are still mid-prefill (num_computed < num_prompt),
+                # so the replay write-cursor (computed - prompt) would be
+                # negative. ReplaySSM only supports true AR-decode rows.
+                raise NotImplementedError(
+                    "--use-replayssm does not support single-token prefill "
+                    "rows replayed through the decode path"
+                )
             is_prefilling = is_prefilling.clone()
             is_prefilling[prefill_to_decode] = False
             common_attn_metadata = common_attn_metadata.replace(
@@ -431,6 +491,11 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
 
         # for causal_conv1d
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+
+        # for ReplaySSM AR decode
+        write_pos_d = None
+        is_flush_d = None
+        bc_pre_scratch = None
 
         if self.vllm_config.cache_config.mamba_cache_mode == "all":
             num_computed_tokens = common_attn_metadata.compute_num_computed_tokens()
@@ -518,6 +583,53 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     num_reqs - num_prefills : num_reqs
                 ]
 
+        if self.use_cached_kernel and num_decodes > 0:
+            # Derive each decode row's ring-buffer write cursor and flush flag.
+            num_prompt_tokens_cpu = common_attn_metadata.num_prompt_tokens_cpu
+            num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
+            if num_prompt_tokens_cpu is None or num_computed_tokens_cpu is None:
+                raise ValueError(
+                    "--use-replayssm requires CPU prompt and computed-token "
+                    "counts to derive decode write positions"
+                )
+            decode_steps_cpu = (
+                num_computed_tokens_cpu[:num_decodes]
+                - num_prompt_tokens_cpu[:num_decodes]
+            )
+            query_lens_cpu = (
+                common_attn_metadata.query_start_loc_cpu[1 : num_decodes + 1]
+                - common_attn_metadata.query_start_loc_cpu[:num_decodes]
+            )
+            valid_decode_rows = query_lens_cpu > 0
+            if torch.any(decode_steps_cpu[valid_decode_rows] < 0).item():
+                raise ValueError(
+                    "--use-replayssm requires decode-step counts that exclude "
+                    "prompt tokens and start at zero"
+                )
+            decode_steps_cpu = torch.where(
+                valid_decode_rows,
+                decode_steps_cpu,
+                torch.zeros_like(decode_steps_cpu),
+            )
+            write_pos_cpu = torch.remainder(decode_steps_cpu, self.max_cache_len)
+            is_flush_cpu = (write_pos_cpu == self.max_cache_len - 1).to(torch.int8)
+            device = common_attn_metadata.query_start_loc.device
+            write_pos_d = async_tensor_h2d(
+                write_pos_cpu.to(torch.int32).tolist(),
+                dtype=torch.int32,
+                device=device,
+            )
+            is_flush_d = async_tensor_h2d(
+                is_flush_cpu.tolist(),
+                dtype=torch.int8,
+                device=device,
+            )
+            if (
+                self.cached_kernel_variant == "output_only"
+                and self.decode_bc_pre_scratch is not None
+            ):
+                bc_pre_scratch = self.decode_bc_pre_scratch[:num_decodes]
+
         metadata = self.metadata_cls(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -541,6 +653,9 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            write_pos_d=write_pos_d,
+            is_flush_d=is_flush_d,
+            bc_pre_scratch=bc_pre_scratch,
         )
 
         return self._update_metadata_for_cudagraph_capture(metadata)
@@ -561,6 +676,9 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         block_idx_last_scheduled_token_prev_step = (
             metadata.block_idx_last_scheduled_token_prev_step
         )
+        write_pos_d = metadata.write_pos_d
+        is_flush_d = metadata.is_flush_d
+        bc_pre_scratch = metadata.bc_pre_scratch
         if (
             metadata.num_prefills == 0
             and metadata.num_decodes <= self.decode_cudagraph_max_bs
@@ -622,6 +740,26 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     )
                     block_idx_last_scheduled_token_prev_step[metadata.num_decodes :] = 0
 
+            if self.use_cached_kernel and write_pos_d is not None:
+                # Copy the per-step replay cursors into the fixed-address buffers
+                # so the captured graph replays from a stable base pointer.
+                self.decode_write_pos_d[: metadata.num_decodes].copy_(
+                    write_pos_d, non_blocking=True
+                )
+                write_pos_d = self.decode_write_pos_d[:padded_bs]
+                write_pos_d[metadata.num_decodes :] = 0
+                assert is_flush_d is not None
+                self.decode_is_flush_d[: metadata.num_decodes].copy_(
+                    is_flush_d, non_blocking=True
+                )
+                is_flush_d = self.decode_is_flush_d[:padded_bs]
+                is_flush_d[metadata.num_decodes :] = 0
+                if (
+                    self.cached_kernel_variant == "output_only"
+                    and self.decode_bc_pre_scratch is not None
+                ):
+                    bc_pre_scratch = self.decode_bc_pre_scratch[:padded_bs]
+
         return replace(
             metadata,
             state_indices_tensor_d=state_indices_tensor_d,
@@ -632,6 +770,9 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
             block_idx_last_scheduled_token_prev_step=(
                 block_idx_last_scheduled_token_prev_step
             ),
+            write_pos_d=write_pos_d,
+            is_flush_d=is_flush_d,
+            bc_pre_scratch=bc_pre_scratch,
         )
 
     def update_block_table(

@@ -576,27 +576,28 @@ class FalconH1ForCausalLM(
     def get_mamba_state_dtype_from_config(
         cls,
         vllm_config: "VllmConfig",
-    ) -> tuple[torch.dtype, torch.dtype]:
-        return MambaStateDtypeCalculator.mamba2_state_dtype(
+    ) -> tuple[torch.dtype, ...]:
+        return MambaStateDtypeCalculator.mamba2_cached_state_dtype(
             vllm_config.model_config.dtype,
             vllm_config.cache_config.mamba_cache_dtype,
             vllm_config.cache_config.mamba_ssm_cache_dtype,
+            use_replayssm=vllm_config.cache_config.use_replayssm,
         )
 
     @classmethod
     def get_mamba_state_shape_from_config(
         cls,
         vllm_config: "VllmConfig",
-    ) -> tuple[tuple[int, int], tuple[int, int, int]]:
+    ) -> tuple[tuple[int, ...], ...]:
         """Calculate shapes for Mamba's convolutional and state caches.
 
         Args:
             vllm_config: vLLM config
 
         Returns:
-            Tuple containing:
-            - conv_state_shape: Shape for convolutional state cache
-            - temporal_state_shape: Shape for state space model cache
+            Tuple containing the conv-state and SSM-state shapes (and, when
+            ReplaySSM is enabled, the x_cache/dt_cache/B_cache ring-buffer
+            shapes). Must match ``MambaMixer2.get_state_shape``.
         """
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_config
@@ -607,7 +608,7 @@ class FalconH1ForCausalLM(
             else hf_config.mamba_d_ssm
         )
 
-        return MambaStateShapeCalculator.mamba2_state_shape(
+        return MambaStateShapeCalculator.mamba2_cached_state_shape(
             intermediate_size=intermediate_size,
             tp_world_size=parallel_config.tensor_parallel_size,
             n_groups=hf_config.mamba_n_groups,
@@ -615,6 +616,8 @@ class FalconH1ForCausalLM(
             head_dim=hf_config.mamba_d_head,
             state_size=hf_config.mamba_d_state,
             conv_kernel=hf_config.mamba_d_conv,
+            use_replayssm=vllm_config.cache_config.use_replayssm,
+            replayssm_buffer_len=vllm_config.cache_config.replayssm_buffer_len,
         )
 
     @classmethod

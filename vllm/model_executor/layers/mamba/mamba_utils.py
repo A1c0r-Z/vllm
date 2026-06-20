@@ -81,6 +81,29 @@ class MambaStateDtypeCalculator:
         )
 
     @classmethod
+    def mamba2_cached_state_dtype(
+        cls,
+        model_dtype: ModelDType | torch.dtype,
+        mamba_cache_dtype: MambaDType,
+        mamba_ssm_cache_dtype: MambaDType,
+        use_replayssm: bool,
+    ) -> tuple[torch.dtype, ...]:
+        """Mamba2 state dtypes, extended for the ReplaySSM decode kernel.
+
+        Returns the baseline ``(conv, ssm)`` dtypes when ``use_replayssm`` is
+        ``False``; otherwise appends the ring-buffer dtypes
+        ``(x_cache, dt_cache, B_cache)`` = ``(activation, fp32, activation)``.
+        Must stay in sync with ``MambaMixer2.get_state_dtype``.
+        """
+        conv_dtype, ssm_dtype = cls.mamba2_state_dtype(
+            model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
+        )
+        if not use_replayssm:
+            return conv_dtype, ssm_dtype
+        activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
+        return conv_dtype, ssm_dtype, activation_dtype, torch.float32, activation_dtype
+
+    @classmethod
     def _mamba_state_dtype(
         cls,
         model_dtype: ModelDType | torch.dtype,
@@ -185,6 +208,56 @@ class MambaStateShapeCalculator:
         #   e.g., (h_heads, head_dim, state_size) = (128, 64, 128)
         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
         return conv_state_shape, temporal_state_shape
+
+    @classmethod
+    def mamba2_cached_state_shape(
+        cls,
+        tp_world_size: int,
+        intermediate_size: int,
+        n_groups: int,
+        num_heads: int,
+        head_dim: int,
+        state_size: int,
+        conv_kernel: int,
+        use_replayssm: bool,
+        replayssm_buffer_len: int,
+        num_spec: int = 0,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Mamba2 state shapes, extended for the ReplaySSM decode kernel.
+
+        Returns the baseline ``(conv, ssm)`` shapes when ``use_replayssm`` is
+        ``False``; otherwise appends the ring-buffer shapes
+        ``x_cache``/``dt_cache``/``B_cache``. The ring buffers use the
+        un-extended ``n_groups``/``num_heads`` divided by ``tp_world_size``
+        (the head-shard group extension only applies to the conv state inside
+        ``mamba2_state_shape``). Must stay in sync with
+        ``MambaMixer2.get_state_shape``.
+        """
+        conv_state_shape, temporal_state_shape = cls.mamba2_state_shape(
+            tp_world_size=tp_world_size,
+            intermediate_size=intermediate_size,
+            n_groups=n_groups,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            state_size=state_size,
+            conv_kernel=conv_kernel,
+            num_spec=num_spec,
+        )
+        if not use_replayssm:
+            return conv_state_shape, temporal_state_shape
+
+        local_nheads = divide(num_heads, tp_world_size)
+        local_ngroups = divide(n_groups, tp_world_size)
+        x_cache_shape = (local_nheads, replayssm_buffer_len, head_dim)
+        dt_cache_shape = (local_nheads, replayssm_buffer_len)
+        B_cache_shape = (local_ngroups, replayssm_buffer_len, state_size)
+        return (
+            conv_state_shape,
+            temporal_state_shape,
+            x_cache_shape,
+            dt_cache_shape,
+            B_cache_shape,
+        )
 
     @classmethod
     def short_conv_state_shape(
